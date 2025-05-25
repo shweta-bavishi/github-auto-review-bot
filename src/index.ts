@@ -38,6 +38,8 @@ async function main() {
     const { body, number, title, html_url } = payload.pull_request;
     const owner = payload.repository.owner.login;
     const repo = payload.repository.name;
+    const pr = payload.pull_request;
+    const sha = pr.head.sha;
 
     // If no description, generate one
     if (!body?.trim()) {
@@ -60,7 +62,84 @@ async function main() {
         });
         console.log(`✅ Commented summary on PR #${number}`);
 
-        // …after your existing await octokit.issues.createComment call…
+        const { data: commit } = await octokit.rest.repos.getCommit({
+          owner,
+          repo,
+          ref: sha,
+        });
+  
+        const filesChanged = commit.files || [];
+        if (!filesChanged.length) {
+          console.log(`ℹ️ PR #${number} has no file changes to summarize.`);
+          return;
+        }
+
+        const MAX_FILES = 3;
+        const MAX_LINES = 20;
+        const diffSnippet = filesChanged
+          .slice(0, MAX_FILES)
+          .map((f) => {
+            const lines = f.patch!
+              .split("\n")
+              .slice(0, MAX_LINES)
+              .join("\n");
+            return `File: ${f.filename}\n${lines}${
+              f.patch!.split("\n").length > MAX_LINES ? "\n...(truncated)" : ""
+            }`;
+          })
+          .join("\n\n---\n\n");
+
+          const contentSnippet = await Promise.all(
+            filesChanged.slice(0, MAX_FILES).map(async (f) => {
+              const { data } = await octokit.rest.repos.getContent({
+                owner,
+                repo,
+                path: f.filename,
+                ref: sha,
+              });
+              const content = Buffer.from(
+                (data as any).content,
+                "base64"
+              ).toString("utf8");
+              return `// ${f.filename}\n${content.slice(
+                0,
+                2000
+              )}${content.length > 2000 ? "\n...(truncated)" : ""}`;
+            })
+          );
+
+          const commentPrompt = `
+          You are a senior software engineer. Summarize the changes in this new pull request, based on the diff and file contents.
+          
+          Please provide:
+          1. A 2–3 bullet overview of the intent.
+          2. File-by-file improvement suggestions.
+          3. Any bugs, missing functionality, or security/performance concerns.
+          
+          <<DIFF>>
+          ${diffSnippet}
+          
+          <<FILES>>
+          ${contentSnippet.join("\n\n---\n\n")}
+          
+          <<END>>
+          `;
+
+          const aicompletion = await openai.completions.create({
+            model: "gpt-3.5-turbo-instruct",
+            prompt: commentPrompt,
+            max_tokens: 600,
+            temperature: 0.2,
+          });
+          const reviewComment = aicompletion.choices[0].text.trim();
+
+          await octokit.rest.issues.createComment({
+            owner,
+            repo,
+            issue_number: number,
+            body: `### 🤖 PR Change Summary\n\n${reviewComment}\n\n---\n`,
+          });
+          console.log(`✅ Posted PR summary on #${number}`);
 
         // 1️⃣ Prepare a prompt to suggest labels
         const listFiles = await octokit.rest.pulls.listFiles({
@@ -185,52 +264,69 @@ Output a comma-separated list only.
 
       // build absolute paths for each file
       const fileContents = await Promise.all(
-        filesChanged.map(async f => {
+        filesChanged.map(async (f) => {
           const { data } = await octokit.rest.repos.getContent({
-            owner, repo, path: f.filename, ref: sha
+            owner,
+            repo,
+            path: f.filename,
+            ref: sha,
           });
-          const content = Buffer.from((data as any).content, 'base64').toString('utf8');
+          const content = Buffer.from((data as any).content, "base64").toString(
+            "utf8"
+          );
           return { filename: f.filename, patch: f.patch!, content };
         })
       );
-      
+
       // — Truncate to first 3 files
       const MAX_FILES = 3;
       const MAX_LINES = 20;
 
-      const diffSnippet = filesChanged.slice(0, MAX_FILES).map(f => {
-        const lines = f.patch!.split("\n").slice(0, 20).join("\n");
-        return `File: ${f.filename}\n${lines}`;
-      }).join("\n\n---\n\n");
+      const diffSnippet = filesChanged
+        .slice(0, MAX_FILES)
+        .map((f) => {
+          const lines = f.patch!.split("\n").slice(0, MAX_LINES).join("\n");
+          return `File: ${f.filename}\n${lines}${
+            f.patch!.split("\n").length > MAX_LINES ? "\n...(truncated)" : ""
+          }`;
+        })
+        .join("\n\n---\n\n");
 
-      const contentSnippet = fileContents.slice(0, MAX_FILES).map(f =>
-        `// ${f.filename}\n${f.content.slice(0, 2000)}`
-      ).join("\n\n---\n\n");
+      const contentSnippet = fileContents
+        .slice(0, MAX_FILES)
+        .map(
+          (f) =>
+            `// ${f.filename}\n${f.content.slice(
+              0,
+              2000
+            )}${f.content.length > 2000 ? "\n...(truncated)" : ""}`
+        )
+        .join("\n\n---\n\n");
 
       // 3. Build a richer prompt
       const prompt = `
-      You are a senior software engineer reviewing a pull request. Below is the diff and file contents.
-      
-      Please:
-      - Summarize the intent of the commit in 2–3 bullet points.
-      - For each file, suggest improvements or note issues.
-      - Highlight bugs, missing functionality, or bad practices.
-      - Mention any security, logic, or performance issues.
-      
-      <<DIFF>>
-      ${diffSnippet}
-      
-      <<FILES>>
-      ${contentSnippet}
-      
-      <<END>>
-      `;
+You are a senior software engineer reviewing a pull request. Below is the diff and file contents.
+
+Please:
+- Summarize the intent of the commit in 2–3 bullet points.
+- For each file, suggest improvements or note issues.
+- Highlight bugs, missing functionality, or bad practices.
+- Mention any security, logic, or performance issues.
+
+<<DIFF>>
+${diffSnippet}
+
+<<FILES>>
+${contentSnippet}
+
+<<END>>
+`;
 
       // 4. Ask OpenAI to generate the review comment
       const completion = await openai.completions.create({
         model: "gpt-3.5-turbo-instruct",
         prompt,
-        max_tokens: 400,
+        max_tokens: 600,
         temperature: 0.2,
       });
       const reviewComment = completion.choices[0].text.trim();
@@ -243,17 +339,25 @@ Output a comma-separated list only.
         body: `### 🤖 Commit Review (${sha.slice(0, 7)})\n\n${reviewComment}\n\n---\n`,
       });
 
+      const overview = reviewComment
+        .split("\n")
+        .filter((l) => l.match(/^[-*]\s+/))
+        .slice(0, 3)
+        .join("\n");
+
       // 6️⃣ Create a GitHub Check Run with inline annotations
 
       await octokit.rest.checks.create({
-        owner, repo,
+        owner,
+        repo,
         name: "AI Review",
         head_sha: sha,
         status: "completed",
-        conclusion:  "neutral",
+        conclusion: "neutral",
         output: {
           title: `Senior Review for PR #${number}`,
-          summary: completion.choices[0].text.trim()
+          summary: overview,
+          text: reviewComment,
         },
       });
 
